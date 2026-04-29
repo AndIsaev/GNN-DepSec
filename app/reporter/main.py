@@ -50,6 +50,7 @@ HTML_TEMPLATE = """
             <th>Package</th>
             <th>Version</th>
             <th>CVE</th>
+            <th>CVSS Score</th>
             <th>Risk Score</th>
             <th>Vulnerability Path</th>
             <th>Fixed In</th>
@@ -59,6 +60,7 @@ HTML_TEMPLATE = """
             <td>{{ item.name }}</td>
             <td>{{ item.version }}</td>
             <td>{{ item.cve_id }}</td>
+            <td>{{ item.cvss_score }}</td>
             <td>{{ item.risk_score }}</td>
             <td>{{ item.path }}</td>
             <td>{{ item.fixed_in }}</td>
@@ -78,15 +80,7 @@ def load_nx_graph(path: Path) -> nx.MultiDiGraph:
 
 
 def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float) -> List[dict]:
-    """Находит уязвимые версии и пути достижимости.
-
-    Args:
-        nx_graph: NetworkX граф с risk_score.
-        threshold: Пороговое значение риска.
-
-    Returns:
-        Список словарей с информацией об уязвимых узлах.
-    """
+    """Находит все уязвимые версии и для каждой уязвимости формирует отдельную запись."""
     vulnerable = []
     for node, attrs in nx_graph.nodes(data=True):
         if attrs.get("node_type") != "version":
@@ -95,36 +89,51 @@ def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float) -> List[di
         if risk is None or risk < threshold:
             continue
 
-        # Ищем путь до корневого проекта
+        # Все корневые узлы (для поиска пути)
         root_nodes = [n for n, a in nx_graph.nodes(data=True) if a.get("is_root")]
-        paths = []
-        for root in root_nodes:
-            try:
-                path = nx.shortest_path(nx_graph, root, node)
-                paths.append(" -> ".join(path))
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                pass
-        path_str = " ; ".join(paths) if paths else "unknown"
-
-        # Достаём информацию об уязвимости из рёбер VULNERABLE_TO
-        fixed_in = None
-        cve_id = None
+        # Получаем все CVE через исходящие рёбра VULNERABLE_TO
         for _, tgt, data in nx_graph.out_edges(node, data=True):
             if data.get("type") == "VULNERABLE_TO":
                 fixed_in = data.get("fixed_in")
-                # Получаем cve_id из узла уязвимости
+                cve_id = None
+                cvss_score = None
+                cvss_vector = None
                 if tgt in nx_graph.nodes:
-                    cve_id = nx_graph.nodes[tgt].get("cve_id")
-                break
+                    cve_attrs = nx_graph.nodes[tgt]
+                    cve_id = cve_attrs.get("cve_id")
+                    cvss_score = cve_attrs.get("cvss_score")
+                    cvss_vector = cve_attrs.get("cvss_vector")
+                # Формируем читаемый путь
+                paths = []
+                for root in root_nodes:
+                    try:
+                        path_nodes = nx.shortest_path(nx_graph, root, node)
+                        # Заменяем ID на имена пакетов (из атрибутов)
+                        readable = []
+                        for nd in path_nodes:
+                            nd_attrs = nx_graph.nodes[nd]
+                            if nd_attrs.get("node_type") == "version":
+                                readable.append(nd_attrs.get("name", nd))
+                            else:
+                                readable.append(nd)   # на практике путь только из version
+                        paths.append(" → ".join(readable))
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        pass
+                path_str = " ; ".join(paths) if paths else "unknown"
 
-        vulnerable.append({
-            "name": attrs["name"],
-            "version": attrs["version"],
-            "risk_score": risk,
-            "path": path_str,
-            "fixed_in": fixed_in or "N/A",
-            "cve_id": cve_id or "N/A",
-        })
+                vulnerable.append({
+                    "name": attrs["name"],
+                    "version": attrs["version"],
+                    "risk_score": risk,
+                    "cve_id": cve_id or "N/A",
+                    "cvss_score": cvss_score,
+                    "cvss_vector": cvss_vector or "",
+                    "fixed_in": fixed_in or "N/A",
+                    "path": path_str,
+                })
+
+    # Сортируем по убыванию риска
+    vulnerable.sort(key=lambda x: x["risk_score"], reverse=True)
     return vulnerable
 
 
@@ -138,28 +147,38 @@ def generate_report(vulnerable: List[dict], threshold: float, output_path: Path)
 
 
 def generate_visualization(nx_graph: nx.MultiDiGraph, output_path: Path) -> None:
-    """Создаёт интерактивную визуализацию графа с помощью pyvis."""
+    """Создаёт интерактивную визуализацию графа."""
     net = Network(height="800px", width="100%", directed=True)
 
     for node, attrs in nx_graph.nodes(data=True):
         node_type = attrs.get("node_type", "unknown")
         if node_type == "version":
             risk = attrs.get("risk_score", 0.0)
-            # Три зоны риска
             if risk > 0.7:
-                color = "#ff0000"      # красный
+                color = "#ff0000"
             elif risk > 0.3:
-                color = "#ffcc00"      # жёлтый
+                color = "#ffcc00"
             else:
-                color = "#00cc00"      # зелёный
-            title = f"Name: {attrs.get('name')}<br>Version: {attrs.get('version')}<br>Risk: {risk:.4f}"
+                color = "#00cc00"
+            title = (f"Name: {attrs.get('name')}<br>Version: {attrs.get('version')}<br>"
+                     f"Risk: {risk:.4f}")
+            label = attrs.get("name", node)
+        elif node_type == "package":
+            color = "lightblue"
+            # Имя пакета из id
+            pkg_name = node.split("/", 1)[1] if "/" in node else node
+            title = f"Package: {pkg_name}"
+            label = pkg_name
         elif node_type == "vulnerability":
             color = "orange"
-            title = f"CVE: {attrs.get('cve_id', '')}"
+            cve = attrs.get("cve_id", node.split("/", 1)[1] if "/" in node else node)
+            title = f"CVE: {cve}"
+            label = cve
         else:
-            color = "lightblue"
-            title = f"Package: {attrs.get('name', '')}"
-        net.add_node(node, label=attrs.get("name", node), color=color, title=title)
+            color = "gray"
+            title = node
+            label = node
+        net.add_node(node, label=label, color=color, title=title)
 
     for src, dst, data in nx_graph.edges(data=True):
         edge_type = data.get("type", "")
