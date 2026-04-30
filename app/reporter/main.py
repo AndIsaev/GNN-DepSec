@@ -13,7 +13,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -35,16 +35,21 @@ HTML_TEMPLATE = """
     <title>Vulnerability Report</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 40px; }
-        table { border-collapse: collapse; width: 100%; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background-color: #f2f2f2; }
         .risk-high { background-color: #ffcccc; }
         .risk-medium { background-color: #fff3cc; }
+        .suspicious { background-color: #fff8e1; }
+        caption { font-weight: bold; margin-bottom: 5px; }
     </style>
 </head>
 <body>
     <h1>Vulnerability Analysis Report</h1>
-    <h3>Threshold: {{ threshold }}</h3>
+    <p><strong>Threshold for critical:</strong> {{ threshold }}</p>
+    <p>Пакеты с риском ≥ {{ threshold }} считаются уязвимыми, от 0.3 до {{ threshold }} – подозрительными (нет прямых CVE, но соседствуют с уязвимыми).</p>
+
+    <h2>Критические уязвимости</h2>
     <table>
         <tr>
             <th>Package</th>
@@ -67,6 +72,27 @@ HTML_TEMPLATE = """
         </tr>
         {% endfor %}
     </table>
+
+    {% if suspicious %}
+    <h2>Подозрительные зависимости (требуют ручного анализа)</h2>
+    <p>Эти пакеты не имеют зарегистрированных CVE, но получили повышенную оценку риска из-за близости к уязвимым компонентам в графе зависимостей.</p>
+    <table>
+        <tr>
+            <th>Package</th>
+            <th>Version</th>
+            <th>Risk Score</th>
+            <th>Connection Path</th>
+        </tr>
+        {% for item in suspicious %}
+        <tr class="suspicious">
+            <td>{{ item.name }}</td>
+            <td>{{ item.version }}</td>
+            <td>{{ item.risk_score }}</td>
+            <td>{{ item.path }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
 </body>
 </html>
 """
@@ -79,68 +105,107 @@ def load_nx_graph(path: Path) -> nx.MultiDiGraph:
     return json_graph.node_link_graph(data)
 
 
-def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float) -> List[dict]:
-    """Находит все уязвимые версии и для каждой уязвимости формирует отдельную запись."""
+def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float, suspicious_threshold: float = 0.3) -> Tuple[
+    List[dict], List[dict]]:
+    """Находит уязвимые и подозрительные версии.
+
+    Args:
+        nx_graph: граф.
+        threshold: порог для отнесения к уязвимым (например 0.5).
+        suspicious_threshold: нижний порог для подозрительных (например 0.3).
+
+    Returns:
+        (vulnerable_list, suspicious_list)
+    """
     vulnerable = []
+    suspicious = []
+
     for node, attrs in nx_graph.nodes(data=True):
         if attrs.get("node_type") != "version":
             continue
         risk = attrs.get("risk_score")
-        if risk is None or risk < threshold:
+        if risk is None:
             continue
 
-        # Все корневые узлы (для поиска пути)
-        root_nodes = [n for n, a in nx_graph.nodes(data=True) if a.get("is_root")]
-        # Получаем все CVE через исходящие рёбра VULNERABLE_TO
+        # Ищем все CVE, связанные с этим узлом
+        cve_entries = []
         for _, tgt, data in nx_graph.out_edges(node, data=True):
             if data.get("type") == "VULNERABLE_TO":
                 fixed_in = data.get("fixed_in")
                 cve_id = None
                 cvss_score = None
-                cvss_vector = None
                 if tgt in nx_graph.nodes:
                     cve_attrs = nx_graph.nodes[tgt]
                     cve_id = cve_attrs.get("cve_id")
                     cvss_score = cve_attrs.get("cvss_score")
-                    cvss_vector = cve_attrs.get("cvss_vector")
-                # Формируем читаемый путь
-                paths = []
-                for root in root_nodes:
-                    try:
-                        path_nodes = nx.shortest_path(nx_graph, root, node)
-                        # Заменяем ID на имена пакетов (из атрибутов)
-                        readable = []
-                        for nd in path_nodes:
-                            nd_attrs = nx_graph.nodes[nd]
-                            if nd_attrs.get("node_type") == "version":
-                                readable.append(nd_attrs.get("name", nd))
-                            else:
-                                readable.append(nd)   # на практике путь только из version
-                        paths.append(" → ".join(readable))
-                    except (nx.NetworkXNoPath, nx.NodeNotFound):
-                        pass
-                path_str = " ; ".join(paths) if paths else "unknown"
+                cve_entries.append({
+                    "cve_id": cve_id or "N/A",
+                    "cvss_score": cvss_score,
+                    "fixed_in": fixed_in or "N/A"
+                })
 
+        # Ищем путь до корневого проекта (для читаемости)
+        root_nodes = [n for n, a in nx_graph.nodes(data=True) if a.get("is_root")]
+        paths = []
+        for root in root_nodes:
+            try:
+                path_nodes = nx.shortest_path(nx_graph, root, node)
+                readable = []
+                for nd in path_nodes:
+                    nd_attrs = nx_graph.nodes[nd]
+                    if nd_attrs.get("node_type") == "version":
+                        readable.append(nd_attrs.get("name", nd))
+                    else:
+                        readable.append(nd)
+                paths.append(" → ".join(readable))
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                pass
+        path_str = " ; ".join(paths) if paths else "unknown"
+
+        # Формируем записи
+        if risk >= threshold:
+            # Уязвимый узел: выводим по одной строке на каждый CVE (если их нет, то одну пустую строку)
+            if cve_entries:
+                for cve in cve_entries:
+                    vulnerable.append({
+                        "name": attrs["name"],
+                        "version": attrs["version"],
+                        "risk_score": risk,
+                        "cve_id": cve["cve_id"],
+                        "cvss_score": cve["cvss_score"],
+                        "fixed_in": cve["fixed_in"],
+                        "path": path_str
+                    })
+            else:
+                # теоретически не должно быть, но на всякий случай
                 vulnerable.append({
                     "name": attrs["name"],
                     "version": attrs["version"],
                     "risk_score": risk,
-                    "cve_id": cve_id or "N/A",
-                    "cvss_score": cvss_score,
-                    "cvss_vector": cvss_vector or "",
-                    "fixed_in": fixed_in or "N/A",
-                    "path": path_str,
+                    "cve_id": "N/A",
+                    "cvss_score": None,
+                    "fixed_in": "N/A",
+                    "path": path_str
                 })
+        elif risk >= suspicious_threshold and not cve_entries:
+            # Подозрительный: риск повышен, но CVE нет
+            suspicious.append({
+                "name": attrs["name"],
+                "version": attrs["version"],
+                "risk_score": risk,
+                "path": path_str
+            })
 
-    # Сортируем по убыванию риска
+    # Сортировка по убыванию риска
     vulnerable.sort(key=lambda x: x["risk_score"], reverse=True)
-    return vulnerable
+    suspicious.sort(key=lambda x: x["risk_score"], reverse=True)
+    return vulnerable, suspicious
 
 
-def generate_report(vulnerable: List[dict], threshold: float, output_path: Path) -> None:
-    """Генерирует HTML-отчёт с таблицей уязвимостей."""
+def generate_report(vulnerable: List[dict], suspicious: List[dict], threshold: float, output_path: Path) -> None:
+    """Генерирует HTML-отчёт с таблицами для уязвимых и подозрительных пакетов."""
     template = Template(HTML_TEMPLATE)
-    html = template.render(vulnerable=vulnerable, threshold=threshold)
+    html = template.render(vulnerable=vulnerable, suspicious=suspicious, threshold=threshold)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
     logger.info("Report saved to %s", output_path)
@@ -207,10 +272,10 @@ def main() -> None:
         sys.exit(1)
 
     nx_graph = load_nx_graph(args.nx_input)
-    vulnerable = find_vulnerabilities(nx_graph, args.threshold)
+    vulnerable, suspicious = find_vulnerabilities(nx_graph, args.threshold)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    generate_report(vulnerable, args.threshold, args.output_dir / "report.html")
+    generate_report(vulnerable, suspicious, args.threshold, args.output_dir / "report.html")
     generate_visualization(nx_graph, args.output_dir / "graph.html")
 
 
