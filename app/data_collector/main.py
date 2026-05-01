@@ -145,8 +145,6 @@ def collect_dependencies(project_path: Path) -> CollectorOutput:
             walk(dep, is_root=False)
 
     for entry in tree:
-        if entry.get("key") == "pipdeptree":
-            continue  # пропускаем инструментальный пакет и все его зависимости
         walk(entry, is_root=True)
 
     packages.sort(key=lambda p: p.name)
