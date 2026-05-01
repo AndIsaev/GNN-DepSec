@@ -94,11 +94,14 @@ def find_venv_python(project_root: Path) -> Optional[Path]:
 # Сбор зависимостей
 # ---------------------------------------------------------------------------
 
-def collect_dependencies() -> CollectorOutput:
+def collect_dependencies(project_path: Path) -> CollectorOutput:
     """Собирает информацию о зависимостях через ``pipdeptree --json-tree``.
 
     Рекурсивно обходит дерево, полученное от pipdeptree, выделяя корневые
     пакеты (is_root=True) и транзитивные зависимости (is_root=False).
+
+    Args:
+        project_path: Путь к python установленный в виртуальной среде проекта
 
     Returns:
         Объект CollectorOutput с заполненным списком пакетов.
@@ -107,7 +110,7 @@ def collect_dependencies() -> CollectorOutput:
     logger.info("Collecting dependencies via pipdeptree...")
     try:
         result = subprocess.run(
-            ["pipdeptree", "--json-tree"],
+            ["pipdeptree", "--json-tree", "--python", project_path],
             capture_output=True,
             text=True,
             check=True
@@ -183,6 +186,10 @@ def main() -> None:
         description="Data Collector – извлекает список пакетов и их зависимости."
     )
     parser.add_argument(
+        "--project-path", type=Path, required=True,
+        help="Путь до pytnon виртуальной среды проекта (/path/venv/bin/python).",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("dependencies.json"),
         help="Путь для сохранения JSON-файла с результатами."
     )
@@ -205,7 +212,7 @@ def main() -> None:
             logger.error("No virtual environment found.")
         sys.exit(1)
 
-    output = collect_dependencies()
+    output = collect_dependencies(args.project_path)
     if not output.packages:
         logger.error("No packages collected. Exiting.")
         sys.exit(1)
