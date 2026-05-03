@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
-"""
-Graph Builder (FR2) – построение гетерогенного графа зависимостей.
-
-Принимает JSON-файл от Data Collector и строит два представления графа:
-  - NetworkX MultiDiGraph (для визуализации и анализа путей),
-  - PyTorch Geometric HeteroData (для машинного обучения).
-
-Использование:
-    python graph_builder.py --input deps.json --output-dir ./graph_output [--github-token ghp_...]
-"""
-
 import argparse
+import asyncio
 import json
 import logging
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+import aiohttp
 import networkx as nx
 import torch
 from networkx.readwrite import json_graph
@@ -29,125 +19,193 @@ from torch_geometric.data import HeteroData
 # ---------------------------------------------------------------------------
 # Логирование
 # ---------------------------------------------------------------------------
-
 logger = logging.getLogger("graph_builder")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+# Коэффициент нормализации временных меток (секунды → «миллиардные доли»)
+TIMESTAMP_SCALE = 1e9
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции для признаков
+# Вспомогательные функции
 # ---------------------------------------------------------------------------
 
 def parse_version(ver_str: str) -> Tuple[int, int, int]:
-    """Извлекает major, minor, patch из строки версии PEP 440.
-    Для простоты обрезаем до трёх чисел, остальное игнорируем.
-    Возвращает 0 для отсутствующих частей.
+    """Возвращает кортеж (major, minor, patch) из строки версии PEP 440.
+
+    Если какая-либо часть отсутствует, подставляется 0.
+
+    Args:
+        ver_str: Строка версии, например "2.4.1" или "1.0a2".
+
+    Returns:
+        Кортеж из трёх целых чисел.
     """
-    parts = re.split(r'[.\-]', ver_str)
-    nums = []
+    parts = re.split(r"[.\-]", ver_str)
+    numbers = []
     for p in parts:
         if p.isdigit():
-            nums.append(int(p))
+            numbers.append(int(p))
         else:
             break
-    while len(nums) < 3:
-        nums.append(0)
-    return nums[0], nums[1], nums[2]
+    while len(numbers) < 3:
+        numbers.append(0)
+    return numbers[0], numbers[1], numbers[2]
 
 
 def is_prerelease(ver_str: str) -> bool:
-    """True, если версия содержит a, b, rc, dev, pre и т.п."""
-    return bool(re.search(r'[a-zA-Z]', ver_str))
+    """Проверяет, является ли версия предварительным релизом.
+
+    Args:
+        ver_str: Строка версии.
+
+    Returns:
+        True, если версия содержит буквенные маркеры (a, b, rc, dev и т.п.).
+    """
+    return bool(re.search(r"[a-zA-Z]", ver_str))
+
+
+def iso_to_timestamp(iso_str: Optional[str]) -> float:
+    """Преобразует ISO-строку даты в нормализованную временную метку.
+
+    Args:
+        iso_str: Строка в формате ISO 8601, возможно с 'Z' на конце.
+
+    Returns:
+        Число секунд с начала эпохи, делённое на 1e9, или 0.0, если
+        строка отсутствует или не может быть разобрана.
+    """
+    if not iso_str:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.timestamp() / TIMESTAMP_SCALE
+    except (ValueError, TypeError):
+        logger.debug("Failed to parse date '%s'", iso_str)
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
-# Взаимодействие с внешними API
+# Асинхронные запросы к внешним API
 # ---------------------------------------------------------------------------
 
-def fetch_github_timestamps(project_urls: dict, auth_headers: dict) -> Dict[str, Optional[str]]:
-    """Извлекает ключевые даты из GitHub API для репозитория пакета."""
-    default = {'created_at': None, 'updated_at': None, 'pushed_at': None}
+async def fetch_github_timestamps_async(
+    session: aiohttp.ClientSession,
+    project_urls: Dict[str, str],
+    auth_headers: Dict[str, str],
+) -> Dict[str, Optional[str]]:
+    """Асинхронно получает ключевые даты репозитория из GitHub API.
+
+    Ищет в словаре project_urls URL, содержащий 'github.com', и делает
+    запрос к API.
+
+    Args:
+        session: Асинхронная сессия aiohttp.
+        project_urls: Словарь с URL проекта (ключи – названия, значения – ссылки).
+        auth_headers: Заголовки для авторизации (может содержать Bearer токен).
+
+    Returns:
+        Словарь с ключами 'created_at', 'updated_at', 'pushed_at'.
+        Если данные получить не удалось, все значения – None.
+    """
+    default = {"created_at": None, "updated_at": None, "pushed_at": None}
     if not project_urls:
         return default
+
     for url in project_urls.values():
-        if isinstance(url, str) and 'github.com' in url:
-            parts = url.rstrip('/').split('/')
-            if len(parts) >= 2:
-                owner, repo = parts[-2], parts[-1]
-                if repo.endswith('.git'):
-                    repo = repo[:-4]
-                try:
-                    resp = requests.get(
-                        f'https://api.github.com/repos/{owner}/{repo}',
-                        timeout=5,
-                        headers=auth_headers
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        return {
-                            'created_at': data.get('created_at'),
-                            'updated_at': data.get('updated_at'),
-                            'pushed_at': data.get('pushed_at'),
-                        }
-                    else:
-                        logger.debug("GitHub API returned %d for %s/%s", resp.status_code, owner, repo)
-                except Exception as e:
-                    logger.debug("GitHub request failed for %s/%s: %s", owner, repo, e)
+        if not isinstance(url, str) or "github.com" not in url:
+            continue
+        parts = url.rstrip("/").split("/")
+        if len(parts) < 2:
+            continue
+        owner, repo = parts[-2], parts[-1]
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+
+        try:
+            async with session.get(
+                f"https://api.github.com/repos/{owner}/{repo}",
+                headers=auth_headers,
+                timeout=5,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "created_at": data.get("created_at"),
+                        "updated_at": data.get("updated_at"),
+                        "pushed_at": data.get("pushed_at"),
+                    }
+                logger.debug(
+                    "GitHub API returned %d for %s/%s", resp.status, owner, repo
+                )
+        except Exception as e:
+            logger.debug("GitHub request failed for %s/%s: %s", owner, repo, e)
+
     return default
 
 
-def fetch_package_metadata(name: str, auth_headers: dict) -> Dict[str, Any]:
-    """Получает агрегированные метаданные пакета из PyPI и GitHub,
-    а также информацию о всех версиях (даты и флаги пререлизов).
+async def fetch_package_metadata_async(
+    session: aiohttp.ClientSession,
+    name: str,
+    auth_headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Асинхронно собирает агрегированные метаданные пакета из PyPI и GitHub.
+
+    Для каждого пакета получает общую информацию с PyPI, даты с GitHub,
+    а также сведения о всех доступных версиях (дата загрузки и признак пререлиза).
+
+    Args:
+        session: Асинхронная сессия aiohttp.
+        name: Имя пакета в PyPI.
+        auth_headers: Заголовки авторизации для GitHub API.
 
     Returns:
         Словарь с ключами:
-          - creation_date, total_releases, created_at, updated_at, pushed_at, is_deprecated,
-          - releases_info: словарь {version: {'upload_time': str или None, 'is_prerelease': bool}}
+            creation_date, total_releases, created_at, updated_at,
+            pushed_at, is_deprecated, releases_info.
     """
-    url = f'https://pypi.org/pypi/{name}/json'
+    url = f"https://pypi.org/pypi/{name}/json"
     try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            info = data.get('info', {})
-            releases = data.get('releases', {})
-            first_release_dates = [
-                rel.get('upload_time')
-                for rels in releases.values()
-                for rel in rels
-                if rel.get('upload_time')
-            ]
-            creation_date = min(first_release_dates) if first_release_dates else None
-            gh_dates = fetch_github_timestamps(info.get('project_urls', {}), auth_headers)
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                info = data.get("info", {})
+                releases = data.get("releases", {})
 
-            # Собираем информацию по каждой версии
-            releases_info = {}
-            for ver, files in releases.items():
-                upload_time = None
-                if files:
-                    upload_time = files[0].get('upload_time')
-                releases_info[ver] = {
-                    'upload_time': upload_time,
-                    'is_prerelease': is_prerelease(ver)
+                first_release_dates = [
+                    rel.get("upload_time")
+                    for files in releases.values()
+                    for rel in files
+                    if rel.get("upload_time")
+                ]
+                creation_date = min(first_release_dates) if first_release_dates else None
+
+                gh_dates = await fetch_github_timestamps_async(
+                    session, info.get("project_urls", {}), auth_headers
+                )
+
+                releases_info: Dict[str, Dict[str, Any]] = {}
+                for ver, files in releases.items():
+                    upload_time = files[0].get("upload_time") if files else None
+                    releases_info[ver] = {
+                        "upload_time": upload_time,
+                        "is_prerelease": is_prerelease(ver),
+                    }
+
+                return {
+                    "creation_date": creation_date,
+                    "total_releases": len(releases),
+                    "created_at": gh_dates.get("created_at"),
+                    "updated_at": gh_dates.get("updated_at"),
+                    "pushed_at": gh_dates.get("pushed_at"),
+                    "is_deprecated": bool(info.get("deprecated")),
+                    "releases_info": releases_info,
                 }
-
-            return {
-                'creation_date': creation_date,
-                'total_releases': len(releases),
-                'created_at': gh_dates['created_at'],
-                'updated_at': gh_dates['updated_at'],
-                'pushed_at': gh_dates['pushed_at'],
-                'is_deprecated': bool(info.get('deprecated')),
-                'releases_info': releases_info
-            }
-        else:
-            logger.warning("PyPI API returned %d for package %s", resp.status_code, name)
-    except requests.RequestException as e:
+            logger.warning("PyPI API returned %d for package %s", resp.status, name)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logger.warning("Failed to fetch package metadata for %s: %s", name, e)
 
     return {
@@ -157,7 +215,7 @@ def fetch_package_metadata(name: str, auth_headers: dict) -> Dict[str, Any]:
         "updated_at": None,
         "pushed_at": None,
         "is_deprecated": False,
-        "releases_info": {}
+        "releases_info": {},
     }
 
 
@@ -165,197 +223,159 @@ def fetch_package_metadata(name: str, auth_headers: dict) -> Dict[str, Any]:
 # Построение графа
 # ---------------------------------------------------------------------------
 
-def build_graph(deps_json: Dict[str, Any], auth_headers: dict) -> Tuple[nx.MultiDiGraph, HeteroData]:
-    """Строит гетерогенный граф зависимостей из JSON, полученного от Data Collector."""
-    packages = deps_json["packages"]
+def build_graph(
+    deps_json: Dict[str, Any],
+    package_metadata: Dict[str, Dict[str, Any]],
+) -> Tuple[nx.MultiDiGraph, HeteroData]:
+    """Строит гетерогенный граф зависимостей из данных о пакетах и метаданных.
+
+    Создаёт два представления:
+      - NetworkX MultiDiGraph с узлами типов 'version' и 'package',
+        рёбрами 'HAS_VERSION' и 'DEPENDS_ON'.
+      - PyTorch Geometric HeteroData с аналогичной структурой и
+        числовыми признаками для каждого типа узлов.
+
+    Args:
+        deps_json: Словарь, загруженный из JSON-файла Data Collector.
+            Ожидается ключ 'packages' со списком установленных пакетов.
+        package_metadata: Словарь, сопоставляющий имени пакета его
+            метаданные (результат fetch_package_metadata_async).
+
+    Returns:
+        Кортеж из двух элементов: NetworkX MultiDiGraph и HeteroData.
+    """
+    packages: List[Dict[str, Any]] = deps_json["packages"]
+    unique_names: List[str] = sorted(package_metadata.keys())
 
     nx_graph = nx.MultiDiGraph()
     hetero_data = HeteroData()
 
-    # Временные структуры для сбора информации об узлах
-    version_features: Dict[str, List[Any]] = {
-        "name": [], "version": [], "pushed_at": [],
-        "is_root": [],
-    }
-    package_features: Dict[str, List[Any]] = {
-        "name": [], "creation_date": [], "total_releases": [],
-        "created_at": [], "updated_at": [], "pushed_at": [], "is_deprecated": [],
-    }
-
-    created_packages: Set[str] = set()
+    # -------- Версии (узлы типа 'version') и их признаки --------
     version_idx: Dict[str, int] = {}
-    package_idx: Dict[str, int] = {}
-    # Словарь для сохранения полных метаданных пакетов (включая releases_info)
-    package_meta_dict: Dict[str, Dict[str, Any]] = {}
-
-    logger.info("Building graph...")
+    version_names: List[str] = []
+    version_features: List[List[float]] = []
 
     for pkg in packages:
         name = pkg["name"]
-        version = pkg["version"]
-        is_root = pkg["is_root"]
+        if name in version_idx:
+            continue
+        version_idx[name] = len(version_names)
+        version_names.append(name)
 
-        if name not in version_idx:
-            version_idx[name] = len(version_idx)
-            version_features["name"].append(name)
-            version_features["version"].append(version)
-            version_features["is_root"].append(is_root)
-            version_features["pushed_at"].append(None)  # заполнится позже
-
-            nx_graph.add_node(
-                f"version/{name}",
-                node_type="version",
-                name=name,
-                version=version,
-                is_root=is_root,
-            )
-
-        if name not in created_packages:
-            created_packages.add(name)
-            package_idx[name] = len(package_idx)
-            pkg_meta = fetch_package_metadata(name, auth_headers)
-            package_meta_dict[name] = pkg_meta  # сохраняем для признаков
-            package_features["name"].append(name)
-            package_features["creation_date"].append(pkg_meta["creation_date"])
-            package_features["total_releases"].append(pkg_meta["total_releases"])
-            package_features["created_at"].append(pkg_meta["created_at"])
-            package_features["updated_at"].append(pkg_meta["updated_at"])
-            package_features["pushed_at"].append(pkg_meta["pushed_at"])
-            package_features["is_deprecated"].append(pkg_meta["is_deprecated"])
-
-            nx_graph.add_node(
-                f"package/{name}",
-                node_type="package",
-                **{k: v for k, v in pkg_meta.items() if k != "releases_info"}
-            )
-
-    # Перенос pushed_at из узлов Package в узлы Version (NetworkX)
-    for node, attrs in nx_graph.nodes(data=True):
-        if attrs.get("node_type") == "version":
-            pkg_name = attrs["name"]
-            pkg_node = f"package/{pkg_name}"
-            if pkg_node in nx_graph:
-                pushed_at = nx_graph.nodes[pkg_node].get("pushed_at")
-                if pushed_at:
-                    nx_graph.nodes[node]["pushed_at"] = pushed_at
-                    idx = version_idx.get(pkg_name)
-                    if idx is not None:
-                        version_features["pushed_at"][idx] = pushed_at
-
-    # Добавляем рёбра HAS_VERSION и DEPENDS_ON
-    for pkg in packages:
-        source_name = pkg["name"]
-        source_is_root = pkg["is_root"]
-
-        if source_name in package_idx and source_name in version_idx:
-            nx_graph.add_edge(
-                f"package/{source_name}",
-                f"version/{source_name}",
-                type="HAS_VERSION"
-            )
-
-        for dep_name in pkg["requires"]:
-            if dep_name not in version_idx:
-                logger.warning("Dependency '%s' (required by '%s') not found in installed packages, skipping edge.",
-                               dep_name, source_name)
-                continue
-            dep_type = "direct" if source_is_root else "transitive"
-            nx_graph.add_edge(
-                f"version/{source_name}",
-                f"version/{dep_name}",
-                type="DEPENDS_ON",
-                dep_type=dep_type
-            )
-
-    logger.info("Graph built: %d versions, %d packages", len(version_idx), len(package_idx))
-
-    # ---------- ФОРМИРОВАНИЕ ПРИЗНАКОВЫХ ТЕНЗОРОВ ----------
-    version_names = version_features["name"]
-    # Признаки Version: major, minor, patch, is_prerelease, release_timestamp, is_root, pkg_pushed_at
-    version_feat_list = []
-    for i, name in enumerate(version_names):
-        ver_str = version_features["version"][i]
+        ver_str: str = pkg["version"]
         major, minor, patch = parse_version(ver_str)
-        pre = 1.0 if is_prerelease(ver_str) else 0.0
+        pre_flag = 1.0 if is_prerelease(ver_str) else 0.0
 
-        # Дата релиза конкретной версии
-        rinfo = None
-        if name in package_meta_dict:
-            rinfo = package_meta_dict[name].get('releases_info', {}).get(ver_str)
-        if rinfo and rinfo['upload_time']:
-            dt = datetime.fromisoformat(rinfo['upload_time'].replace('Z', '+00:00'))
-            release_ts = dt.timestamp() / 1e9  # нормализация грубая, позже сделаем StandardScaler
-        else:
-            release_ts = 0.0
+        # Дата загрузки конкретной версии
+        rinfo = package_metadata.get(name, {}).get("releases_info", {}).get(ver_str, {})
+        release_timestamp = iso_to_timestamp(rinfo.get("upload_time"))
 
-        is_root_val = 1.0 if version_features["is_root"][i] else 0.0
+        is_root_val = 1.0 if pkg["is_root"] else 0.0
+        pkg_pushed_ts = iso_to_timestamp(package_metadata.get(name, {}).get("pushed_at"))
 
-        # pushed_at пакета (уже есть в version_features["pushed_at"] либо None)
-        pkg_pushed_at_str = version_features["pushed_at"][i]
-        if pkg_pushed_at_str:
-            dt = datetime.fromisoformat(pkg_pushed_at_str.replace('Z', '+00:00'))
-            pkg_pushed_ts = dt.timestamp() / 1e9
-        else:
-            pkg_pushed_ts = 0.0
+        version_features.append(
+            [major, minor, patch, pre_flag, release_timestamp, is_root_val, pkg_pushed_ts]
+        )
 
-        version_feat_list.append([major, minor, patch, pre, release_ts, is_root_val, pkg_pushed_ts])
+        nx_graph.add_node(
+            f"version/{name}",
+            node_type="version",
+            name=name,
+            version=ver_str,
+            is_root=is_root_val,
+            pushed_at=package_metadata.get(name, {}).get("pushed_at"),
+        )
 
-    x_version = torch.tensor(version_feat_list, dtype=torch.float)
-    hetero_data['version'].x = x_version
-    hetero_data['version'].names = version_names
+    # -------- Пакеты (узлы типа 'package') и их признаки --------
+    package_idx: Dict[str, int] = {}
+    package_names: List[str] = []
+    package_features: List[List[float]] = []
 
-    # Признаки Package: total_releases, creation_timestamp, pushed_at_timestamp, is_deprecated
-    package_names = package_features["name"]
-    package_feat_list = []
-    for i, name in enumerate(package_names):
-        meta = package_meta_dict.get(name, {})
-        total_rel = float(meta.get('total_releases', 0))
-        cr_date = meta.get('creation_date')
-        if cr_date:
-            dt = datetime.fromisoformat(cr_date.replace('Z', '+00:00'))
-            cr_ts = dt.timestamp() / 1e9
-        else:
-            cr_ts = 0.0
-        push_date = meta.get('pushed_at')
-        if push_date:
-            dt = datetime.fromisoformat(push_date.replace('Z', '+00:00'))
-            push_ts = dt.timestamp() / 1e9
-        else:
-            push_ts = 0.0
+    for name in unique_names:
+        package_idx[name] = len(package_names)
+        package_names.append(name)
+        meta = package_metadata.get(name, {})
 
-        is_depr = 1.0 if meta.get('is_deprecated') else 0.0
-        package_feat_list.append([total_rel, cr_ts, push_ts, is_depr])
+        total_rel = float(meta.get("total_releases", 0))
+        cr_ts = iso_to_timestamp(meta.get("creation_date"))
+        push_ts = iso_to_timestamp(meta.get("pushed_at"))
+        is_depr = 1.0 if meta.get("is_deprecated") else 0.0
 
-    x_package = torch.tensor(package_feat_list, dtype=torch.float)
-    hetero_data['package'].x = x_package
-    hetero_data['package'].names = package_names
+        package_features.append([total_rel, cr_ts, push_ts, is_depr])
 
-    # Рёбра DEPENDS_ON в HeteroData
-    dep_sources, dep_targets = [], []
+        nx_graph.add_node(
+            f"package/{name}",
+            node_type="package",
+            name=name,
+            creation_date=meta.get("creation_date"),
+            total_releases=total_rel,
+            created_at=meta.get("created_at"),
+            updated_at=meta.get("updated_at"),
+            pushed_at=meta.get("pushed_at"),
+            is_deprecated=is_depr,
+        )
+
+    # -------- Рёбра HAS_VERSION --------
+    for name in unique_names:
+        if name in version_idx:
+            nx_graph.add_edge(
+                f"package/{name}", f"version/{name}", type="HAS_VERSION"
+            )
+
+    # -------- Рёбра DEPENDS_ON --------
+    dep_sources: List[int] = []
+    dep_targets: List[int] = []
+
     for pkg in packages:
         src_name = pkg["name"]
+        src_is_root = pkg["is_root"]
         if src_name not in version_idx:
             continue
         for dep_name in pkg["requires"]:
-            if dep_name in version_idx:
-                dep_sources.append(version_idx[src_name])
-                dep_targets.append(version_idx[dep_name])
+            if dep_name not in version_idx:
+                logger.warning(
+                    "Dependency '%s' (required by '%s') not found in installed packages, skipping.",
+                    dep_name,
+                    src_name,
+                )
+                continue
+            dep_type = "direct" if src_is_root else "transitive"
+            nx_graph.add_edge(
+                f"version/{src_name}",
+                f"version/{dep_name}",
+                type="DEPENDS_ON",
+                dep_type=dep_type,
+            )
+            dep_sources.append(version_idx[src_name])
+            dep_targets.append(version_idx[dep_name])
+
+    logger.info(
+        "Graph built: %d versions, %d packages, %d DEPENDS_ON edges",
+        len(version_names),
+        len(package_names),
+        len(dep_sources),
+    )
+
+    # -------- Тензоры для HeteroData --------
+    hetero_data["version"].x = torch.tensor(version_features, dtype=torch.float)
+    hetero_data["version"].names = version_names
+
+    hetero_data["package"].x = torch.tensor(package_features, dtype=torch.float)
+    hetero_data["package"].names = package_names
 
     if dep_sources:
-        dep_edge_index = torch.tensor([dep_sources, dep_targets], dtype=torch.long)
-        hetero_data['version', 'DEPENDS_ON', 'version'].edge_index = dep_edge_index
-        logger.info("Added %d DEPENDS_ON edges.", len(dep_sources))
+        edge_index = torch.tensor([dep_sources, dep_targets], dtype=torch.long)
+        hetero_data["version", "DEPENDS_ON", "version"].edge_index = edge_index
 
-    # Рёбра HAS_VERSION
     has_sources, has_targets = [], []
-    for pkg_name in created_packages:
-        if pkg_name in package_idx and pkg_name in version_idx:
-            has_sources.append(package_idx[pkg_name])
-            has_targets.append(version_idx[pkg_name])
+    for name in unique_names:
+        if name in version_idx:
+            has_sources.append(package_idx[name])
+            has_targets.append(version_idx[name])
     if has_sources:
-        has_edge_index = torch.tensor([has_sources, has_targets], dtype=torch.long)
-        hetero_data['package', 'HAS_VERSION', 'version'].edge_index = has_edge_index
-        logger.info("Added %d HAS_VERSION edges.", len(has_sources))
+        hetero_data["package", "HAS_VERSION", "version"].edge_index = torch.tensor(
+            [has_sources, has_targets], dtype=torch.long
+        )
 
     return nx_graph, hetero_data
 
@@ -364,13 +384,21 @@ def build_graph(deps_json: Dict[str, Any], auth_headers: dict) -> Tuple[nx.Multi
 # Сохранение
 # ---------------------------------------------------------------------------
 
-def save_graphs(nx_graph: nx.MultiDiGraph, hetero_data: HeteroData, output_dir: Path) -> None:
-    """Сохраняет оба представления графа в файлы."""
+def save_graphs(
+    nx_graph: nx.MultiDiGraph, hetero_data: HeteroData, output_dir: Path
+) -> None:
+    """Сохраняет оба представления графа в файлы.
+
+    Args:
+        nx_graph: NetworkX граф.
+        hetero_data: PyTorch Geometric HeteroData.
+        output_dir: Путь к директории для сохранения.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+
     nx_path = output_dir / "nx_graph.json"
-    data = json_graph.node_link_data(nx_graph)
     with open(nx_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(json_graph.node_link_data(nx_graph), f, indent=2, ensure_ascii=False)
     logger.info("NetworkX graph saved to %s", nx_path)
 
     het_path = output_dir / "hetero_data.pt"
@@ -379,22 +407,84 @@ def save_graphs(nx_graph: nx.MultiDiGraph, hetero_data: HeteroData, output_dir: 
 
 
 # ---------------------------------------------------------------------------
+# Асинхронная обвязка
+# ---------------------------------------------------------------------------
+
+async def main_async(args: argparse.Namespace) -> None:
+    """Основная асинхронная логика: загрузка метаданных и построение графа.
+
+    Args:
+        args: Аргументы командной строки после парсинга.
+    """
+    auth_headers: Dict[str, str] = {}
+    if args.github_token:
+        auth_headers["Authorization"] = f"Bearer {args.github_token}"
+        logger.info("Using authenticated GitHub requests.")
+    else:
+        logger.warning(
+            "No GitHub token provided – rate limits may be exceeded quickly."
+        )
+
+    with open(args.input, "r", encoding="utf-8") as f:
+        deps = json.load(f)
+
+    packages = deps["packages"]
+    unique_names = sorted({pkg["name"] for pkg in packages})
+    logger.info(
+        "Fetching metadata for %d unique packages asynchronously...",
+        len(unique_names),
+    )
+
+    connector = aiohttp.TCPConnector(limit=20)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            fetch_package_metadata_async(session, name, auth_headers)
+            for name in unique_names
+        ]
+        results = await asyncio.gather(*tasks)
+
+    package_metadata = dict(zip(unique_names, results))
+    logger.info("Metadata fetched for %d packages.", len(package_metadata))
+
+    nx_graph, hetero_data = build_graph(deps, package_metadata)
+    save_graphs(nx_graph, hetero_data, args.output_dir)
+    logger.info("Done.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Точка входа для CLI."""
+    """Точка входа в приложение.
+
+    Парсит аргументы командной строки, настраивает логирование и запускает
+    асинхронный рабочий процесс.
+    """
     parser = argparse.ArgumentParser(
         description="Graph Builder (FR2) – построение гетерогенного графа."
     )
-    parser.add_argument("--input", type=Path, required=True,
-                        help="Путь к JSON-файлу от Data Collector.")
-    parser.add_argument("--output-dir", type=Path, default=Path("./graph_output"),
-                        help="Директория для сохранения графов.")
-    parser.add_argument("--github-token", type=str, default=os.getenv("GITHUB_TOKEN"),
-                        help="GitHub токен (или установите переменную GITHUB_TOKEN).")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Подробное логирование.")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Путь к JSON-файлу от Data Collector.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("./graph_output"),
+        help="Директория для сохранения графов.",
+    )
+    parser.add_argument(
+        "--github-token",
+        type=str,
+        default=os.getenv("GITHUB_TOKEN"),
+        help="GitHub токен (или установите переменную GITHUB_TOKEN).",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Подробное логирование."
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -404,19 +494,7 @@ def main() -> None:
         logger.error("Input file '%s' not found.", args.input)
         sys.exit(1)
 
-    auth_headers = {}
-    if args.github_token:
-        auth_headers["Authorization"] = f"Bearer {args.github_token}"
-        logger.info("Using authenticated GitHub requests.")
-    else:
-        logger.warning("No GitHub token provided – rate limits may be exceeded quickly.")
-
-    with open(args.input, "r", encoding="utf-8") as f:
-        deps = json.load(f)
-
-    nx_graph, hetero_data = build_graph(deps, auth_headers)
-    save_graphs(nx_graph, hetero_data, args.output_dir)
-    logger.info("Done.")
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":

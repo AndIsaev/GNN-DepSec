@@ -1,32 +1,44 @@
 #!/usr/bin/env python3
-"""
-Reporter & Visualizer (FR5, FR6) – генерация отчёта и визуализация графа.
-
-Принимает NetworkX JSON с risk_score и порог, строит HTML-отчёт и визуализацию.
-
-Использование:
-    python reporter.py --nx-input scored/nx_graph_scored.json --output-dir ./report --threshold 0.5
-"""
-
 import argparse
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import networkx as nx
-from networkx.readwrite import json_graph
 from jinja2 import Template
+from networkx.readwrite import json_graph
 from pyvis.network import Network
 
+# ---------------------------------------------------------------------------
+# Логирование
+# ---------------------------------------------------------------------------
 logger = logging.getLogger("reporter")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+# Пороги для классификации узлов по риску
+SUSPICIOUS_THRESHOLD = 0.3   # нижний порог для "подозрительных" пакетов
+HIGH_RISK_THRESHOLD = 0.7    # выше этого значения – красный цвет в визуализации
+
+# Цвета для визуализации
+COLOR_HIGH_RISK = "#ff0000"       # красный
+COLOR_MEDIUM_RISK = "#ffcc00"     # жёлтый
+COLOR_LOW_RISK = "#00cc00"        # зелёный
+COLOR_PACKAGE = "lightblue"       # голубой для узлов-пакетов
+COLOR_VULNERABILITY = "orange"    # оранжевый для узлов-уязвимостей
+COLOR_UNKNOWN = "gray"            # серый для неизвестных типов
+
+# ---------------------------------------------------------------------------
+# HTML-шаблон отчёта
+# ---------------------------------------------------------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -47,7 +59,7 @@ HTML_TEMPLATE = """
 <body>
     <h1>Vulnerability Analysis Report</h1>
     <p><strong>Threshold for critical:</strong> {{ threshold }}</p>
-    <p>Пакеты с риском ≥ {{ threshold }} считаются уязвимыми, от 0.3 до {{ threshold }} – подозрительными (нет прямых CVE, но соседствуют с уязвимыми).</p>
+    <p>Пакеты с риском ≥ {{ threshold }} считаются уязвимыми, от {{ suspicious_threshold }} до {{ threshold }} – подозрительными (нет прямых CVE, но соседствуют с уязвимыми).</p>
 
     <h2>Критические уязвимости</h2>
     <table>
@@ -97,28 +109,54 @@ HTML_TEMPLATE = """
 </html>
 """
 
-
+# ---------------------------------------------------------------------------
+# Загрузка данных
+# ---------------------------------------------------------------------------
 def load_nx_graph(path: Path) -> nx.MultiDiGraph:
-    """Загружает NetworkX граф из JSON."""
+    """Загружает NetworkX MultiDiGraph из JSON-файла, сохранённого в формате node-link.
+
+    Args:
+        path: Путь к JSON-файлу с данными графа.
+
+    Returns:
+        Восстановленный граф NetworkX.
+    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return json_graph.node_link_graph(data)
 
 
-def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float, suspicious_threshold: float = 0.3) -> Tuple[
-    List[dict], List[dict]]:
-    """Находит уязвимые и подозрительные версии.
+# ---------------------------------------------------------------------------
+# Анализ уязвимостей
+# ---------------------------------------------------------------------------
+def find_vulnerabilities(
+    nx_graph: nx.MultiDiGraph,
+    threshold: float,
+    suspicious_threshold: float = SUSPICIOUS_THRESHOLD,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Извлекает из графа уязвимые и подозрительные версии пакетов.
+
+    Для каждого узла типа 'version' проверяется наличие связанных CVE
+    и значение risk_score. Узлы с оценкой >= threshold классифицируются
+    как уязвимые, а узлы с оценкой от suspicious_threshold до threshold
+    без зарегистрированных CVE — как подозрительные.
+    Для каждого уязвимого узла указывается путь до корневого проекта.
 
     Args:
-        nx_graph: граф.
-        threshold: порог для отнесения к уязвимым (например 0.5).
-        suspicious_threshold: нижний порог для подозрительных (например 0.3).
+        nx_graph: Граф зависимостей с атрибутами risk_score и VULNERABLE_TO.
+        threshold: Порог риска для включения в список уязвимых (например, 0.5).
+        suspicious_threshold: Нижний порог для подозрительных пакетов (по умолчанию 0.3).
 
     Returns:
-        (vulnerable_list, suspicious_list)
+        Кортеж из двух списков:
+        - vulnerable: список словарей с данными уязвимых версий (по одному на каждый CVE);
+        - suspicious: список словарей с подозрительными версиями.
     """
-    vulnerable = []
-    suspicious = []
+    vulnerable: List[Dict[str, Any]] = []
+    suspicious: List[Dict[str, Any]] = []
+
+    # Определяем корневые узлы один раз для ускорения
+    root_nodes = [n for n, a in nx_graph.nodes(data=True) if a.get("is_root")]
 
     for node, attrs in nx_graph.nodes(data=True):
         if attrs.get("node_type") != "version":
@@ -127,11 +165,11 @@ def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float, suspicious
         if risk is None:
             continue
 
-        # Ищем все CVE, связанные с этим узлом
-        cve_entries = []
-        for _, tgt, data in nx_graph.out_edges(node, data=True):
-            if data.get("type") == "VULNERABLE_TO":
-                fixed_in = data.get("fixed_in")
+        # Сбор CVE, связанных с данной версией
+        cve_entries: List[Dict[str, Any]] = []
+        for _, tgt, edge_data in nx_graph.out_edges(node, data=True):
+            if edge_data.get("type") == "VULNERABLE_TO":
+                fixed_in = edge_data.get("fixed_in")
                 cve_id = None
                 cvss_score = None
                 if tgt in nx_graph.nodes:
@@ -141,12 +179,11 @@ def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float, suspicious
                 cve_entries.append({
                     "cve_id": cve_id or "N/A",
                     "cvss_score": cvss_score,
-                    "fixed_in": fixed_in or "N/A"
+                    "fixed_in": fixed_in or "N/A",
                 })
 
-        # Ищем путь до корневого проекта (для читаемости)
-        root_nodes = [n for n, a in nx_graph.nodes(data=True) if a.get("is_root")]
-        paths = []
+        # Построение читаемого пути от корневого проекта до текущего узла
+        paths: List[str] = []
         for root in root_nodes:
             try:
                 path_nodes = nx.shortest_path(nx_graph, root, node)
@@ -162,9 +199,8 @@ def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float, suspicious
                 pass
         path_str = " ; ".join(paths) if paths else "unknown"
 
-        # Формируем записи
         if risk >= threshold:
-            # Уязвимый узел: выводим по одной строке на каждый CVE (если их нет, то одну пустую строку)
+            # Уязвимый узел: по одной строке на каждый связанный CVE
             if cve_entries:
                 for cve in cve_entries:
                     vulnerable.append({
@@ -174,10 +210,10 @@ def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float, suspicious
                         "cve_id": cve["cve_id"],
                         "cvss_score": cve["cvss_score"],
                         "fixed_in": cve["fixed_in"],
-                        "path": path_str
+                        "path": path_str,
                     })
             else:
-                # теоретически не должно быть, но на всякий случай
+                # Теоретически не должно случиться, но оставляем для полноты
                 vulnerable.append({
                     "name": attrs["name"],
                     "version": attrs["version"],
@@ -185,83 +221,151 @@ def find_vulnerabilities(nx_graph: nx.MultiDiGraph, threshold: float, suspicious
                     "cve_id": "N/A",
                     "cvss_score": None,
                     "fixed_in": "N/A",
-                    "path": path_str
+                    "path": path_str,
                 })
         elif risk >= suspicious_threshold and not cve_entries:
-            # Подозрительный: риск повышен, но CVE нет
+            # Подозрительный: риск повышен, но нет прямых CVE
             suspicious.append({
                 "name": attrs["name"],
                 "version": attrs["version"],
                 "risk_score": risk,
-                "path": path_str
+                "path": path_str,
             })
 
-    # Сортировка по убыванию риска
+    # Сортировка по убыванию риска для наглядности
     vulnerable.sort(key=lambda x: x["risk_score"], reverse=True)
     suspicious.sort(key=lambda x: x["risk_score"], reverse=True)
     return vulnerable, suspicious
 
 
-def generate_report(vulnerable: List[dict], suspicious: List[dict], threshold: float, output_path: Path) -> None:
-    """Генерирует HTML-отчёт с таблицами для уязвимых и подозрительных пакетов."""
+# ---------------------------------------------------------------------------
+# Генерация отчёта
+# ---------------------------------------------------------------------------
+def generate_report(
+    vulnerable: List[Dict[str, Any]],
+    suspicious: List[Dict[str, Any]],
+    threshold: float,
+    output_path: Path,
+) -> None:
+    """Генерирует HTML-отчёт с таблицами уязвимых и подозрительных пакетов.
+
+    Использует предопределённый Jinja2-шаблон HTML_TEMPLATE.
+
+    Args:
+        vulnerable: Список уязвимых записей (результат find_vulnerabilities).
+        suspicious: Список подозрительных записей.
+        threshold: Порог риска, используется в описании отчёта.
+        output_path: Путь для сохранения HTML-файла.
+    """
     template = Template(HTML_TEMPLATE)
-    html = template.render(vulnerable=vulnerable, suspicious=suspicious, threshold=threshold)
+    html = template.render(
+        vulnerable=vulnerable,
+        suspicious=suspicious,
+        threshold=threshold,
+        suspicious_threshold=SUSPICIOUS_THRESHOLD,
+    )
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
     logger.info("Report saved to %s", output_path)
 
 
+# ---------------------------------------------------------------------------
+# Визуализация графа
+# ---------------------------------------------------------------------------
 def generate_visualization(nx_graph: nx.MultiDiGraph, output_path: Path) -> None:
-    """Создаёт интерактивную визуализацию графа."""
+    """Создаёт интерактивную HTML‑визуализацию графа с помощью pyvis.
+
+    Узлы окрашиваются в зависимости от типа и уровня риска:
+    - version: цвет от зелёного (низкий риск) до красного (высокий);
+    - package: голубой;
+    - vulnerability: оранжевый.
+    Рёбра подписываются типом связи.
+
+    Args:
+        nx_graph: Граф NetworkX с атрибутами risk_score.
+        output_path: Путь для сохранения HTML-файла визуализации.
+    """
     net = Network(height="800px", width="100%", directed=True)
 
     for node, attrs in nx_graph.nodes(data=True):
         node_type = attrs.get("node_type", "unknown")
         if node_type == "version":
             risk = attrs.get("risk_score", 0.0)
-            if risk > 0.7:
-                color = "#ff0000"
-            elif risk > 0.3:
-                color = "#ffcc00"
+            if risk > HIGH_RISK_THRESHOLD:
+                color = COLOR_HIGH_RISK
+            elif risk > SUSPICIOUS_THRESHOLD:
+                color = COLOR_MEDIUM_RISK
             else:
-                color = "#00cc00"
-            title = (f"Name: {attrs.get('name')}<br>Version: {attrs.get('version')}<br>"
-                     f"Risk: {risk:.4f}")
+                color = COLOR_LOW_RISK
+            title = (
+                f"Name: {attrs.get('name')}<br>"
+                f"Version: {attrs.get('version')}<br>"
+                f"Risk: {risk:.4f}"
+            )
             label = attrs.get("name", node)
         elif node_type == "package":
-            color = "lightblue"
-            # Имя пакета из id
+            color = COLOR_PACKAGE
+            # Извлекаем имя пакета из идентификатора "package/..."
             pkg_name = node.split("/", 1)[1] if "/" in node else node
             title = f"Package: {pkg_name}"
             label = pkg_name
         elif node_type == "vulnerability":
-            color = "orange"
+            color = COLOR_VULNERABILITY
             cve = attrs.get("cve_id", node.split("/", 1)[1] if "/" in node else node)
             title = f"CVE: {cve}"
             label = cve
         else:
-            color = "gray"
+            color = COLOR_UNKNOWN
             title = node
             label = node
+
         net.add_node(node, label=label, color=color, title=title)
 
     for src, dst, data in nx_graph.edges(data=True):
         edge_type = data.get("type", "")
         net.add_edge(src, dst, title=edge_type)
 
-    net.show_buttons(filter_=['physics'])
+    # Показываем кнопки управления физикой для интерактивности
+    net.show_buttons(filter_=["physics"])
     net.save_graph(str(output_path))
     logger.info("Visualization saved to %s", output_path)
 
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Reporter & Visualizer")
-    parser.add_argument("--nx-input", type=Path, required=True,
-                        help="Путь к NetworkX JSON с risk_score.")
-    parser.add_argument("--output-dir", type=Path, default=Path("./report"),
-                        help="Директория для отчётов.")
-    parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Порог риска для отображения.")
-    parser.add_argument("--verbose", action="store_true")
+    """Основная функция – парсинг аргументов и запуск генерации отчётов.
+
+    Загружает граф, находит уязвимые/подозрительные узлы, создаёт
+    HTML-отчёт и интерактивную визуализацию.
+    """
+    parser = argparse.ArgumentParser(
+        description="Reporter & Visualizer – анализ и визуализация графа уязвимостей."
+    )
+    parser.add_argument(
+        "--nx-input",
+        type=Path,
+        required=True,
+        help="Путь к NetworkX JSON с risk_score.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("./report"),
+        help="Директория для сохранения отчётов.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Порог риска для отнесения к критическим уязвимостям.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Подробное логирование.",
+    )
     args = parser.parse_args()
 
     if args.verbose:

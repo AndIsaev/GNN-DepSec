@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-Data Collector (FR1) – сбор списка пакетов и их зависимостей
-с использованием pipdeptree.
-
-Работает только в активном виртуальном окружении.
-"""
-
 import argparse
 import json
 import logging

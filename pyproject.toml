@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "cvss>=3.6",
+    "matplotlib>=3.10.9",
     "networkx>=3.6.1",
+    "pipdeptree>=2.35.2",
     "pyvis>=0.3.2",
     "requests>=2.33.1",
     "ruff>=0.15.12",
