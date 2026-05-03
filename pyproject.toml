@@ -1,0 +1,18 @@
+[project]
+name = "gnn-depsec"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cvss>=3.6",
+    "matplotlib>=3.10.9",
+    "networkx>=3.6.1",
+    "pipdeptree>=2.35.2",
+    "pyvis>=0.3.2",
+    "requests>=2.33.1",
+    "ruff>=0.15.12",
+    "scikit-learn>=1.8.0",
+    "torch>=2.11.0",
+    "torch-geometric>=2.7.0",
+]
