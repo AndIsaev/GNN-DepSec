@@ -90,7 +90,6 @@ for PROJECT in "$PROJECTS_DIR"/*; do
     mkdir -p "$PROJECT_OUT"
 
     echo "🐍 Data Collector..."
-    # Исправленный вызов: скрипт и аргументы передаются раздельно
     python "$CURRENT_DIR/app/data_collector/main.py" \
         --project-path "$VENV_DIR/bin/python" \
         --output "$PROJECT_OUT/dependencies.json" || {
