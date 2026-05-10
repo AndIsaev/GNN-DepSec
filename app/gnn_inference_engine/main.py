@@ -295,8 +295,8 @@ def train_transductive(
     num_pos = (y == 1).sum().item()
     num_neg = (y == 0).sum().item()
     if num_pos == 0:
-        logger.error("No positive examples found. Cannot train.")
-        sys.exit(1)
+        logger.warning("No positive examples found. Training skipped; all risks will be 0.")
+        return None
 
     pos_weight = torch.tensor([num_neg / (num_pos + 1e-5)]).to(device)
 
@@ -530,7 +530,7 @@ def main() -> None:
             logger.error(
                 "For inductive mode, a valid --model-path is required."
             )
-            sys.exit(1)
+            return
         logger.info("Inductive mode: loading model from %s", args.model_path)
 
         version_in = hetero_data["version"].x.size(1)
@@ -561,16 +561,27 @@ def main() -> None:
                 device=args.device,
             )
 
-    # Инференс
-    hetero_data, nx_graph = run_inference(
-        hetero_data, nx_graph, model, args.device
-    )
+    # Инференс или заполнение нулями, если модель не обучена
+    if model is not None:
+        hetero_data, nx_graph = run_inference(
+            hetero_data, nx_graph, model, args.device
+        )
+    else:
+        # Нет ни одной уязвимой версии → все риски = 0
+        risk_scores = torch.zeros(hetero_data["version"].num_nodes)
+        hetero_data["version"].risk_score = risk_scores
+        version_names = hetero_data["version"].names
+        for idx, name in enumerate(version_names):
+            node_id = f"version/{name}"
+            if node_id in nx_graph:
+                nx_graph.nodes[node_id]["risk_score"] = 0.0
+        logger.info("All version nodes marked as safe (risk_score=0.0).")
 
     # Сохранение результатов
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Сохраняем модель только если она обучалась
-    if args.mode == "transductive" or args.fine_tune > 0:
+    if (args.mode == "transductive" or args.fine_tune > 0) and model is not None:
         model_path = args.output_dir / "gnn_model.pt"
         torch.save(model.state_dict(), model_path)
         logger.info("Model saved to %s", model_path)
