@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import random
 import shutil
@@ -55,14 +56,14 @@ SAFE_POOL: List[Tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Конфигурация генерации
 # ---------------------------------------------------------------------------
-NUM_CRITICAL = 10
-NUM_MIXED = 20
-NUM_SAFE = 70
-MIN_DEPS = 5
-BASE_DIR = Path("datasets/fake_projects")
+DEFAULT_NUM_CRITICAL = 10
+DEFAULT_NUM_MIXED = 20
+DEFAULT_NUM_SAFE = 70
+DEFAULT_MIN_DEPS = 5
+DEFAULT_OUTPUT_DIR = Path("datasets/fake_projects")
 
 
-def generate_requirements(project_id: int, category: str) -> str:
+def generate_requirements(project_id: int, category: str, min_deps: int = DEFAULT_MIN_DEPS) -> str:
     """Генерирует содержимое requirements.txt для синтетического проекта.
 
     Для каждого идентификатора проекта фиксируется начальное состояние
@@ -73,12 +74,14 @@ def generate_requirements(project_id: int, category: str) -> str:
         category: Тип проекта: 'critical' – только уязвимые версии,
             'mixed' – смесь уязвимых и безопасных,
             'safe' – только безопасные.
+        min_deps: Минимальное количество зависимостей.
 
     Returns:
         Строка с зависимостями вида `package==version`, по одной на строку.
     """
     random.seed(project_id)
-    num_dependencies = MIN_DEPS + (project_id % 6)  # от 5 до 10
+    # Количество зависимостей варьируется от min_deps до min_deps+5
+    num_dependencies = min_deps + (project_id % 6)
 
     if category == "critical":
         chosen = random.sample(VULNERABLE_POOL, k=num_dependencies)
@@ -97,24 +100,66 @@ def generate_requirements(project_id: int, category: str) -> str:
 
 def main() -> None:
     """Точка входа: создаёт директорию с синтетическими проектами."""
+    parser = argparse.ArgumentParser(
+        description="Генератор синтетических проектов с уязвимыми и безопасными зависимостями."
+    )
+    parser.add_argument(
+        "--critical",
+        type=int,
+        default=DEFAULT_NUM_CRITICAL,
+        help=f"Количество проектов только с уязвимыми зависимостями (по умолчанию {DEFAULT_NUM_CRITICAL})",
+    )
+    parser.add_argument(
+        "--mixed",
+        type=int,
+        default=DEFAULT_NUM_MIXED,
+        help=f"Количество смешанных проектов (по умолчанию {DEFAULT_NUM_MIXED})",
+    )
+    parser.add_argument(
+        "--safe",
+        type=int,
+        default=DEFAULT_NUM_SAFE,
+        help=f"Количество проектов только с безопасными зависимостями (по умолчанию {DEFAULT_NUM_SAFE})",
+    )
+    parser.add_argument(
+        "--min-deps",
+        type=int,
+        default=DEFAULT_MIN_DEPS,
+        help=f"Минимальное количество зависимостей в проекте (по умолчанию {DEFAULT_MIN_DEPS})",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Директория для сохранения проектов (по умолчанию {DEFAULT_OUTPUT_DIR})",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Глобальное случайное зерно для воспроизводимости порядка категорий",
+    )
+    args = parser.parse_args()
+
     # Очистка старых проектов
-    shutil.rmtree(BASE_DIR, ignore_errors=True)
-    # BASE_DIR.mkdir(exist_ok=True)
-    os.makedirs(BASE_DIR, exist_ok=True)
+    shutil.rmtree(args.output_dir, ignore_errors=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Формируем список категорий и перемешиваем для случайного порядка
     categories = (
-        ["critical"] * NUM_CRITICAL
-        + ["mixed"] * NUM_MIXED
-        + ["safe"] * NUM_SAFE
+        ["critical"] * args.critical
+        + ["mixed"] * args.mixed
+        + ["safe"] * args.safe
     )
+    if args.seed is not None:
+        random.seed(args.seed)
     random.shuffle(categories)
 
     for idx, category in enumerate(categories):
-        project_dir = BASE_DIR / f"project_{idx:03d}"
+        project_dir = args.output_dir / f"project_{idx:03d}"
         project_dir.mkdir(exist_ok=True)
         req_path = project_dir / "requirements.txt"
-        content = generate_requirements(idx, category)
+        content = generate_requirements(idx, category, args.min_deps)
         req_path.write_text(content)
         num_lines = content.count("\n") + 1
         print(f"Created {req_path} ({category}) with {num_lines} deps")
