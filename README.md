@@ -129,7 +129,7 @@ uv run python tools/generate_fake_projects.py --output-dir ./my_projects --seed 
 ```text
 GENERATE_FAKE=1 – включить генерацию синтетических проектов перед обработкой.
 
-CRITICAL, MIXED, SAFE (или N_CRITICAL, N_MIXED, N_SAFE) – количество проектов каждой категории (по умолчанию 10/20/70).
+N_CRITICAL, N_MIXED, N_SAFE – количество проектов каждой категории (по умолчанию 10/20/70).
 
 MIN_DEPS – минимальное число зависимостей в проекте.
 
@@ -144,7 +144,7 @@ FORCE_RECREATE – 1 для пересоздания venv каждого про�
 #### Примеры:
 Сгенерировать 20 проектов (5 critical, 5 mixed, 10 safe) и сразу обработать
 ```shell
-GENERATE_FAKE=1 CRITICAL=5 MIXED=5 SAFE=10 ./train_script.sh
+GENERATE_FAKE=1 N_CRITICAL=5 N_MIXED=5 N_SAFE=10 ./train_script.sh
 ```
 Только обработка существующих проектов из другой папки
 ```shell
