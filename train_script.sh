@@ -5,17 +5,39 @@
 set -euo pipefail
 export GITHUB_TOKEN="token"
 
-# === НАСТРОЙКИ ===
-PROJECTS_DIR="./datasets/fake_projects"
-OUTPUT_DIR="./datasets/graphs"
-FORCE_RECREATE=0                           # установите в 1, чтобы пересоздавать .venv
-
 # Проверяем наличие uv
 if ! command -v uv &> /dev/null; then
     echo "❌ uv не найден. Установите его: curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
 
+# === ОПЦИОНАЛЬНАЯ ГЕНЕРАЦИЯ ФЕЙКОВЫХ ПРОЕКТОВ ===
+GENERATE_FAKE="${GENERATE_FAKE:-0}"
+if [ "$GENERATE_FAKE" = "1" ]; then
+    # Сначала проверяем варианты с префиксом N_, потом без
+    N_CRITICAL="${N_CRITICAL:-${CRITICAL:-10}}"
+    N_MIXED="${N_MIXED:-${MIXED:-20}}"
+    N_SAFE="${N_SAFE:-${SAFE:-70}}"
+    MIN_DEPS="${MIN_DEPS:-5}"
+    FAKE_SEED="${FAKE_SEED:-${SEED:-}}"
+    FAKE_OUT_DIR="${FAKE_OUT_DIR:-./datasets/fake_projects}"
+
+    echo "🏗️  Генерирую синтетические проекты..."
+    uv run python app/tools/generate_fake_projects.py \
+        --critical "$N_CRITICAL" \
+        --mixed "$N_MIXED" \
+        --safe "$N_SAFE" \
+        --min-deps "$MIN_DEPS" \
+        --output-dir "$FAKE_OUT_DIR" \
+        $( [ -n "$FAKE_SEED" ] && echo "--seed $FAKE_SEED" )
+fi
+
+# === НАСТРОЙКИ ===
+PROJECTS_DIR="${PROJECTS_DIR:-${FAKE_OUT_DIR:-./datasets/fake_projects}}"
+OUTPUT_DIR="${OUTPUT_DIR:-./datasets/graphs}"
+FORCE_RECREATE=0                           # установите в 1, чтобы пересоздавать .venv
+echo "📂 Проекты будут взяты из: $PROJECTS_DIR"
+echo "📁 Результаты сохранятся в: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
 # Перебираем все поддиректории
