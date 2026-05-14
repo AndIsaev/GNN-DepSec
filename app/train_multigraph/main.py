@@ -125,32 +125,6 @@ class HeteroVulnerabilityGNN(torch.nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции для работы с данными
-# ---------------------------------------------------------------------------
-def add_labels(hetero_data: HeteroData) -> HeteroData:
-    """Добавляет бинарные метки для узлов‑версий (1 – уязвима, 0 – нет).
-
-    Узел считается уязвимым, если у него есть хотя бы одно ребро типа
-    VULNERABLE_TO. Метки сохраняются в поле `hetero_data['version'].y`.
-
-    Args:
-        hetero_data: Гетерогенный граф без меток.
-
-    Returns:
-        Тот же объект HeteroData с добавленными метками.
-    """
-    num_versions = hetero_data["version"].x.size(0)
-    y = torch.zeros(num_versions, dtype=torch.long)
-    edge_type = ("version", "VULNERABLE_TO", "vulnerability")
-    if edge_type in hetero_data.edge_index_dict:
-        edge_index = hetero_data[edge_type].edge_index
-        if edge_index.size(1) > 0:
-            y[edge_index[0].unique()] = 1
-    hetero_data["version"].y = y
-    return hetero_data
-
-
-# ---------------------------------------------------------------------------
 # Нормализация на основе глобальных статистик
 # ---------------------------------------------------------------------------
 def compute_global_stats(graphs: List[HeteroData]) -> Dict[str, Dict[str, np.ndarray]]:
@@ -221,8 +195,9 @@ def load_graphs(
     """Загружает все гетерогенные графы из подпапок директории.
 
     Рекурсивно ищет файлы `hetero_data.pt`. Если переданы глобальные
-    статистики, нормализует признаки с их помощью. Каждому графу
-    назначаются бинарные метки через add_labels.
+    статистики, нормализует признаки с их помощью.
+    Метки достижимости (y) уже должны быть в данных; если отсутствуют,
+    предполагаем отсутствие уязвимостей (все версии безопасны).
 
     Args:
         data_dir: Директория, содержащая подпапки проектов.
@@ -238,9 +213,25 @@ def load_graphs(
     for pt_file in data_dir.rglob("hetero_data.pt"):
         try:
             data = torch.load(pt_file, weights_only=False)
+            # Проверка, что граф не пустой и содержит рёбра для обновления версий
+            has_version = 'version' in data.node_types and data['version'].x.size(0) > 0
+            if not has_version:
+                logger.warning("Graph %s has no version nodes, skipping.", pt_file)
+                continue
+            dst_to_version = False
+            for e in data.edge_index_dict.keys():
+                if len(e) == 3 and e[2] == 'version':
+                    dst_to_version = True
+                    break
+            if not dst_to_version:
+                logger.warning("Graph %s lacks edges targeting 'version', skipping.", pt_file)
+                continue
             if stats is not None:
                 data = normalize_with_stats(data, stats)
-            data = add_labels(data)
+            # Убедимся, что метки y существуют; если нет – заполняем нулями
+            if 'y' not in data['version']:
+                logger.warning("No labels in %s, assuming all versions safe.", pt_file.parent.name)
+                data['version'].y = torch.zeros(data['version'].num_nodes, dtype=torch.long)
             graphs.append(data)
             logger.info("Loaded project from %s", pt_file.parent.name)
         except Exception as e:
@@ -339,7 +330,11 @@ def train_on_multigraphs(
             criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
             optimizer.zero_grad()
-            logits = model(data.x_dict, data.edge_index_dict)
+            try:
+                logits = model(data.x_dict, data.edge_index_dict)
+            except KeyError as ke:
+                # logger.warning("Skipping project due to KeyError: %s. Probably empty graph.", ke)
+                continue
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()

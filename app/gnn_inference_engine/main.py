@@ -129,34 +129,6 @@ class HeteroVulnerabilityGNN(torch.nn.Module):
 # ---------------------------------------------------------------------------
 # Вспомогательные функции обработки данных
 # ---------------------------------------------------------------------------
-def add_labels(hetero_data: HeteroData) -> HeteroData:
-    """Добавляет бинарные метки для узлов‑версий (1 – уязвима, 0 – нет).
-
-    Узел считается уязвимым, если у него есть хотя бы одно ребро
-    VULNERABLE_TO. Метки сохраняются в поле `hetero_data['version'].y`.
-
-    Args:
-        hetero_data: Гетерогенный граф без меток.
-
-    Returns:
-        Тот же объект HeteroData с добавленными метками.
-    """
-    num_versions = hetero_data["version"].x.size(0)
-    y = torch.zeros(num_versions, dtype=torch.long)
-    edge_type = ("version", "VULNERABLE_TO", "vulnerability")
-    if edge_type in hetero_data.edge_index_dict:
-        edge_index = hetero_data[edge_type].edge_index
-        if edge_index.size(1) > 0:
-            y[edge_index[0].unique()] = 1
-    hetero_data["version"].y = y
-    logger.info(
-        "Labels added: %d vulnerable out of %d versions.",
-        y.sum().item(),
-        num_versions,
-    )
-    return hetero_data
-
-
 def normalize_features(hetero_data: HeteroData) -> HeteroData:
     """Нормализует признаки узлов «per‑graph» (Z‑score).
 
@@ -512,8 +484,10 @@ def main() -> None:
     else:
         hetero_data = normalize_features(hetero_data)
 
-    # Добавление меток на основе рёбер VULNERABLE_TO
-    hetero_data = add_labels(hetero_data)
+    # Метки достижимости уже должны быть в hetero_data (добавлены Vulnerability Enricher)
+    if 'y' not in hetero_data['version']:
+        logger.warning("No reachability labels found, assuming all versions safe.")
+        hetero_data['version'].y = torch.zeros(hetero_data['version'].num_nodes, dtype=torch.long)
 
     # Получение модели
     model = None
